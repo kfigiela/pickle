@@ -1,8 +1,12 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DerivingVia #-}
+{-# OPTIONS_GHC -Wno-missing-kind-signatures #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+{-# HLINT ignore "Use <$>" #-}
 
-module Data.Pickle ( Tags(..)
+module Data.Pickle ( Tags
                    , StatsDConfig(..)
                    , MetricData
                    , defaultConfig
@@ -15,18 +19,18 @@ module Data.Pickle ( Tags(..)
                    )
 where
 
-import qualified Data.Map.Strict as M
-import Data.Maybe
-import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
-import qualified Data.Text.IO as T
-import Control.Exception
-import Control.Monad
-import Network.Socket hiding (send)
+import Data.Map.Strict qualified as M
+import Data.Maybe ( fromMaybe )
+import Data.Text qualified as T
+import Data.Text.Encoding qualified as T
+import Data.Text.IO qualified as T
+import Control.Exception ( SomeException, bracketOnError, try )
+import Control.Monad ( void, when )
+import Network.Socket ( getAddrInfo, connect, socket, close, defaultProtocol, AddrInfo(addrAddress, addrFamily), Socket, SocketType(Datagram) )
 import Network.Socket.ByteString (send)
-import Control.Monad.IO.Class
-import System.IO.Unsafe
-import Control.Concurrent.STM
+import System.IO.Unsafe ( unsafePerformIO )
+import Control.Concurrent.STM ( atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar, modifyTVar', TVar )
+import Data.Pickle.MetricData ( MetricData(renderMetricData) )
 
 -- | Tags for DogStatsD. Use empty text for rhs to send a keyed tag with no value. Example: M.fromList [("flag", "")]
 type Tags = M.Map T.Text T.Text
@@ -44,9 +48,6 @@ data StatsDConfig = StatsDConfig { statsdHost      :: T.Text -- ^ Host of statsd
 data Pickle = Pickle { pickleSock :: Socket
                      , pickleCfg  :: StatsDConfig
                      }
-
--- | Something that can be sent as a metric.
-type MetricData a = (Show a, Real a)
 
 -- | Default config used for StatsD UDP connection ()
 defaultConfig :: StatsDConfig
@@ -91,21 +92,15 @@ setupPickle cfg = bracketOnError checkPickle (const finish) setPickle
               close (pickleSock oldPick)
 
 -- | Send a gauge.
-gauge :: (MetricData a) => T.Text -> a -> Maybe Tags -> IO()
+gauge :: (MetricData a) => T.Text -> a -> Maybe Tags -> IO ()
 gauge name val mTags = metric "g" name val mTags Nothing
--- | alias for gauge since it can be hard to spell.
-gage :: (MetricData a) => T.Text -> a -> Maybe Tags -> IO()
-gage  = gauge
--- | alias for gauge since it can be hard to spell.
-guage :: (MetricData a) => T.Text -> a -> Maybe Tags -> IO()
-guage = gauge
 
 -- | Send a counter.
-counter :: (MetricData a) => T.Text -> a -> Maybe Tags -> Maybe Float -> IO()
+counter :: (MetricData a) => T.Text -> a -> Maybe Tags -> Maybe Float -> IO ()
 counter = metric "c"
 
 -- | Send a timer.
-timer :: (MetricData a) => T.Text -> a -> Maybe Tags -> Maybe Float -> IO()
+timer :: (MetricData a) => T.Text -> a -> Maybe Tags -> Maybe Float -> IO ()
 timer = metric "ms"
 
 -- | Send a metric. Parses the options together. This function makes a
@@ -119,25 +114,24 @@ metric :: (MetricData a)
       -> Maybe Float -- ^ Sampling rate for applicable metrics.
       -> IO ()
 metric kind n val mTags mSampling = do
-    mPick <- gpPickle <$> atomically (readTVar pickle)
+    mPick <- gpPickle <$> readTVarIO pickle
     case mPick of
         Nothing -> pure () -- no connection, give up.
         Just (Pickle sock cfg) -> do
-            let tags = parseTags $ (fromMaybe M.empty mTags) <> (statsdTags cfg)
+            let tags = renderTags $ fromMaybe M.empty mTags <> statsdTags cfg
                 sampling = maybe "" (\s -> "|@" <> showT s ) mSampling
-                name = (statsdPrefix cfg) <> n
-                msg  = name <> ":" <> (showT val) <> "|" <> kind <> sampling
+                name = statsdPrefix cfg <> n
+                msg  = name <> ":" <> renderMetricData val <> "|" <> kind <> sampling <> tags
             when (statsdVerbose cfg) (T.putStrLn $ "Sending metric: " <> msg)
-            void $ (try $ send sock $ T.encodeUtf8 msg :: IO(Either SomeException Int))
+            void (try $ send sock $ T.encodeUtf8 msg :: IO (Either SomeException Int))
 
 -- | Parse tags into string to send.
-parseTags :: Tags -> T.Text
-parseTags tags
+renderTags :: Tags -> T.Text
+renderTags tags
     | M.null tags = ""
     | otherwise   = parsed where
-        parsed  = "#|" <> trimmed
-        trimmed = T.dropEnd 1 catted
-        catted  = M.foldrWithKey (\k a b -> b <> k <> (if T.null a then "" else (":" <> a)) <> ",") "" tags
+        parsed  = "|#" <> catted
+        catted  = T.intercalate "," $ fmap (\(k, v) -> k <> (if T.null v then "" else ":" <> v)) $ M.toList tags
 
 data GlobalPickle = GlobalPickle {
     gpSetupRunning :: Bool
